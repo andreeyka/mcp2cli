@@ -343,6 +343,30 @@ def _clean_cache(tmp_path, monkeypatch):
     import mcp2cli
 
     monkeypatch.setattr(mcp2cli, "CACHE_DIR", tmp_path / "cache")
+    # Derived at import time, so redirecting CACHE_DIR alone leaves it real.
+    monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "cache" / "oauth")
+
+
+@pytest.fixture(autouse=True)
+def _no_os_keyring(monkeypatch):
+    """Keep every test away from the real OS keychain.
+
+    keyring's fail backend means "no keyring": OAuth tokens go to the
+    owner-only file, as without the [keyring] extra. The environment variable
+    reaches spawned mcp2cli processes; tests that want the keyring path
+    install an in-memory backend of their own.
+    """
+    import keyring
+    from keyring.backends import fail
+
+    import mcp2cli
+
+    monkeypatch.setenv("PYTHON_KEYRING_BACKEND", "keyring.backends.fail.Keyring")
+    monkeypatch.setattr(mcp2cli, "_tokens_file_warning_shown", False)
+    previous = keyring.get_keyring()
+    keyring.set_keyring(fail.Keyring())
+    yield
+    keyring.set_keyring(previous)
 
 
 @pytest.fixture
