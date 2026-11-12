@@ -27,8 +27,10 @@ jobs:
 
       # --no-deps, then install the matrix SDK explicitly, so the pin under
       # test is the one that gets exercised rather than whatever resolves.
+      # keyring backs the optional [keyring] extra; the OAuth token tests
+      # import it to swap in in-memory backends, never the runner's keychain.
       - run: uv pip install -e . --no-deps
-      - run: uv pip install "${{ matrix.mcp }}" httpx pyyaml pytest pytest-asyncio tiktoken
+      - run: uv pip install "${{ matrix.mcp }}" httpx pyyaml pytest pytest-asyncio tiktoken keyring
 
       # The --toon tests assert real encoder output. Installing the CLI here
       # puts `toon` on PATH, so they exercise it deterministically instead of
@@ -63,7 +65,7 @@ jobs:
       - run: uv venv --python ${{ matrix.python }}
 
       - run: uv pip install -e . --no-deps
-      - run: uv pip install "${{ matrix.mcp }}" httpx pyyaml pytest pytest-asyncio tiktoken
+      - run: uv pip install "${{ matrix.mcp }}" httpx pyyaml pytest pytest-asyncio tiktoken keyring
 
       - name: Report resolved versions
         run: .venv/Scripts/python.exe -c "import importlib.metadata as m; print('mcp', m.version('mcp'))"
