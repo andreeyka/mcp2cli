@@ -51,6 +51,22 @@ class RefusingKeyring(MemoryKeyring):
         raise self.error
 
 
+class RacingKeyring(MemoryKeyring):
+    """macOS keyring under concurrency: set_password is a delete followed by
+    an add, so a parallel writer's add makes ours fail with
+    errSecDuplicateItem (-25299) a few times before it goes through."""
+
+    def __init__(self, collisions: int):
+        super().__init__()
+        self.collisions = collisions
+
+    def set_password(self, service, username, password):
+        if self.collisions:
+            self.collisions -= 1
+            raise PasswordSetError("Can't store password on keychain: (-25299, 'Unknown Error')")
+        super().set_password(service, username, password)
+
+
 class UnreadableKeyring(MemoryKeyring):
     """A keyring whose reads fail (D-Bus gone mid-session, say)."""
 
@@ -552,6 +568,24 @@ class TestKeyringTokenStorage:
         err = capsys.readouterr().err
         assert err.count(_TOKENS_IN_FILE) == 1
         assert str(error) in err
+
+    def test_concurrent_writer_collision_is_retried(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Parallel mcp2cli runs migrating or refreshing the same server's
+        tokens collide inside the keyring's non-atomic set; that is not a
+        reason to leave the tokens in a file or to warn."""
+        import anyio
+
+        backend = RacingKeyring(collisions=2)
+        keyring.set_keyring(backend)
+        storage = self._storage(tmp_path, monkeypatch)
+        storage._tokens_path.write_text(self._token().model_dump_json())
+
+        assert anyio.run(storage.get_tokens).refresh_token == "r"
+        assert json.loads(self._entry(backend))["refresh_token"] == "r"
+        assert not storage._tokens_path.exists()
+        assert capsys.readouterr().err == ""
 
     def test_refused_migration_keeps_token_file(self, tmp_path, monkeypatch, capsys):
         import anyio

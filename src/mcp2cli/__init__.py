@@ -1141,14 +1141,29 @@ class _KeyringTokenSecret:
         self._file.delete()
 
     def _store(self, text: str) -> bool:
-        try:
-            self._backend.set_password(OAUTH_KEYRING_SERVICE, self._username, text)
-        except Exception as exc:
-            _warn_tokens_in_file(
-                f"the OS keyring could not store them ({type(exc).__name__}: {exc})"
-            )
-            return False
-        return True
+        from keyring.errors import PasswordSetError
+
+        # macOS' set is a delete followed by an add, so a parallel mcp2cli
+        # writing the same entry makes the add fail with errSecDuplicateItem,
+        # reported as PasswordSetError; the next attempt goes through. Other
+        # failures (a locked keychain, Windows' size cap, no D-Bus) would fail
+        # again, so they fall back to the file at once.
+        for attempt in range(5):
+            try:
+                self._backend.set_password(OAUTH_KEYRING_SERVICE, self._username, text)
+                return True
+            except PasswordSetError as exc:
+                if attempt == 4:
+                    error = exc
+                    break
+                time.sleep(0.02)
+            except Exception as exc:
+                error = exc
+                break
+        _warn_tokens_in_file(
+            f"the OS keyring could not store them ({type(error).__name__}: {error})"
+        )
+        return False
 
 
 def _token_secret_store(
