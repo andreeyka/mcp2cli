@@ -13,6 +13,23 @@ import pytest
 import mcp2cli
 
 
+posix_only = pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX permission bits"
+)
+
+
+@pytest.fixture
+def permissive_umask():
+    """Run under the common 022 umask, which leaves plain writes world-readable."""
+    previous = os.umask(0o022)
+    yield
+    os.umask(previous)
+
+
+def _mode(path):
+    return path.stat().st_mode & 0o777
+
+
 def _sdk_httpx():
     """The httpx flavour the installed SDK is built on (v2 uses httpx2)."""
     from mcp.shared import _httpx_utils
@@ -315,6 +332,116 @@ class TestFileTokenStorage:
         storage.clear_tokens()
         assert not storage._tokens_path.exists()
         assert not storage._tokens_meta_path.exists()
+
+    # Tokens (Keycloak offline refresh tokens included) and confidential
+    # client secrets must never be readable by other local accounts.
+
+    @posix_only
+    def test_set_tokens_writes_owner_only_files(
+        self, tmp_path, monkeypatch, permissive_umask
+    ):
+        import anyio
+        from mcp.shared.auth import OAuthToken
+
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+        anyio.run(
+            storage.set_tokens,
+            OAuthToken(
+                access_token="a", token_type="Bearer",
+                refresh_token="r", expires_in=3600,
+            ),
+        )
+        assert _mode(storage._tokens_path) == 0o600
+        assert _mode(storage._tokens_meta_path) == 0o600
+
+    @posix_only
+    def test_set_client_info_writes_owner_only_file(
+        self, tmp_path, monkeypatch, permissive_umask
+    ):
+        import anyio
+        from mcp.shared.auth import OAuthClientInformationFull
+
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+        anyio.run(
+            storage.set_client_info,
+            OAuthClientInformationFull(
+                client_id="c", client_secret="s",
+                redirect_uris=["http://127.0.0.1:9999/callback"],
+            ),
+        )
+        assert _mode(storage._client_path) == 0o600
+
+    @posix_only
+    def test_preseeded_client_info_is_owner_only(
+        self, tmp_path, monkeypatch, permissive_umask
+    ):
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        mcp2cli.build_oauth_provider(
+            "https://example.com/mcp",
+            client_id="id",
+            client_secret="secret",
+            redirect_uri="http://localhost:19881/callback",
+            flow="authorization_code",
+            manual_callback=True,
+        )
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+        assert _mode(storage._client_path) == 0o600
+
+    @posix_only
+    def test_oauth_dirs_are_owner_only(
+        self, tmp_path, monkeypatch, permissive_umask
+    ):
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+        assert _mode(tmp_path / "oauth") == 0o700
+        assert _mode(storage._dir) == 0o700
+
+    @posix_only
+    def test_existing_permissive_cache_is_tightened_on_open(
+        self, tmp_path, monkeypatch, permissive_umask
+    ):
+        """Caches written by older versions (0755 dirs, 0644 files) get fixed."""
+        oauth_dir = tmp_path / "oauth"
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", oauth_dir)
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+        files = (
+            storage._tokens_path, storage._tokens_meta_path, storage._client_path
+        )
+        for path in files:
+            path.write_text("{}")
+            os.chmod(path, 0o644)
+        os.chmod(storage._dir, 0o755)
+        os.chmod(oauth_dir, 0o755)
+
+        mcp2cli.FileTokenStorage("https://example.com/mcp")
+
+        assert _mode(oauth_dir) == 0o700
+        assert _mode(storage._dir) == 0o700
+        assert [_mode(path) for path in files] == [0o600] * len(files)
+
+    def test_writes_leave_no_temp_files_behind(self, tmp_path, monkeypatch):
+        import anyio
+        from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+
+        async def _write():
+            await storage.set_tokens(
+                OAuthToken(access_token="a", token_type="Bearer", expires_in=60)
+            )
+            await storage.set_client_info(
+                OAuthClientInformationFull(
+                    client_id="c", redirect_uris=["http://127.0.0.1:9/callback"]
+                )
+            )
+
+        anyio.run(_write)
+        assert sorted(p.name for p in storage._dir.iterdir()) == [
+            "client.json", "tokens.json", "tokens_meta.json",
+        ]
 
 
 class TestRobustOAuthClientProvider:
@@ -752,6 +879,30 @@ class TestRobustOAuthClientProvider:
             assert provider.context.auth_server_url is None
 
         anyio.run(_check)
+
+    @posix_only
+    def test_persisted_discovery_is_owner_only(
+        self, tmp_path, monkeypatch, permissive_umask
+    ):
+        """discovery.json lives next to the tokens and is written the same
+        private way, whatever the umask."""
+        import anyio
+
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        provider = self._split_origin_provider(19889)
+
+        async def _login():
+            await provider._initialize()
+            self._seed_discovery(provider.context)
+            await provider._handle_token_response(
+                _token_endpoint_response(
+                    200, b'{"access_token":"a","token_type":"Bearer"}'
+                )
+            )
+
+        anyio.run(_login)
+        storage = mcp2cli.FileTokenStorage(self._SPLIT_SERVER_URL)
+        assert _mode(storage._discovery_path) == 0o600
 
 
 class TestRobustClientCredentialsProvider:
