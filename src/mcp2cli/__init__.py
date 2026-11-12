@@ -28,6 +28,7 @@ import time
 import webbrowser
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from functools import cached_property
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -1036,16 +1037,165 @@ def _resolve_sort_mode(explicit_sort: str | None, source_hash: str) -> str:
 # ---------------------------------------------------------------------------
 
 OAUTH_DIR = CACHE_DIR / "oauth"
+# OS keyring entries holding OAuth tokens: this service, one entry per server
+# URL as the username -- the URL, not its cache key, so that the entry is
+# recognisable in Keychain Access, Seahorse or Credential Manager.
+OAUTH_KEYRING_SERVICE = "mcp2cli"
+
+_tokens_file_warning_shown = False
+
+
+def _warn_tokens_in_file(reason: str) -> None:
+    """Say, once per process, that OAuth tokens are kept in a file and why.
+
+    Every authenticated call reads the tokens, so repeating the warning on
+    each read or write would bury the command's own output.
+    """
+    global _tokens_file_warning_shown
+    if _tokens_file_warning_shown:
+        return
+    _tokens_file_warning_shown = True
+    print(
+        f"Warning: OAuth tokens are stored in an owner-only file under "
+        f"{OAUTH_DIR}, not in the OS keyring: {reason}.",
+        file=sys.stderr,
+    )
+
+
+def _import_keyring():
+    """Import the optional ``keyring`` package (the ``[keyring]`` extra).
+
+    Returns None when it is not installed. Imported on first token access,
+    so runs that never touch OAuth tokens do not pay for backend discovery.
+    """
+    try:
+        import keyring
+    except ImportError:
+        return None
+    return keyring
+
+
+class _FileTokenSecret:
+    """OAuth tokens in an owner-only file -- used when no keyring is usable."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def read(self) -> str | None:
+        try:
+            return self.path.read_text()
+        except OSError:
+            return None
+
+    def write(self, text: str) -> None:
+        _write_private_file(self.path, text)
+
+    def delete(self) -> None:
+        self.path.unlink(missing_ok=True)
+
+
+class _KeyringTokenSecret:
+    """OAuth tokens in the OS keyring, with the owner-only file as fallback.
+
+    A successful keyring write deletes the file, so a file that exists is
+    never older than the keyring entry: it was written by an mcp2cli without
+    a usable keyring, or by a fallback write the keyring refused. A read
+    therefore prefers the file and moves it into the keyring, after which no
+    token is left on disk.
+
+    Backends raise their platform's own errors as well as KeyringError --
+    pywintypes.error from Windows Credential Manager (which caps a secret at
+    2560 bytes of UTF-16, below a typical token set), SecretStorage's
+    SecretServiceNotAvailableException when D-Bus is gone -- so every call
+    into the backend is guarded with Exception. A failed write falls back to
+    the file: a freshly rotated refresh token must never be lost.
+    """
+
+    def __init__(self, backend, username: str, file: _FileTokenSecret):
+        self._backend = backend
+        self._username = username
+        self._file = file
+
+    def read(self) -> str | None:
+        text = self._file.read()
+        if text is not None:
+            if self._store(text):
+                self._file.delete()
+            return text
+        try:
+            return self._backend.get_password(OAUTH_KEYRING_SERVICE, self._username)
+        except Exception:
+            return None
+
+    def write(self, text: str) -> None:
+        if self._store(text):
+            self._file.delete()
+        else:
+            self._file.write(text)
+
+    def delete(self) -> None:
+        # A missing entry raises PasswordDeleteError; an unreachable keyring
+        # cannot be helped here, and the next login overwrites the entry.
+        with suppress(Exception):
+            self._backend.delete_password(OAUTH_KEYRING_SERVICE, self._username)
+        self._file.delete()
+
+    def _store(self, text: str) -> bool:
+        try:
+            self._backend.set_password(OAUTH_KEYRING_SERVICE, self._username, text)
+        except Exception as exc:
+            _warn_tokens_in_file(
+                f"the OS keyring could not store them ({type(exc).__name__}: {exc})"
+            )
+            return False
+        return True
+
+
+def _token_secret_store(
+    server_url: str, path: Path
+) -> _FileTokenSecret | _KeyringTokenSecret:
+    """Choose where a server's OAuth tokens live: the OS keyring if usable.
+
+    keyring always returns *some* backend; with nothing real available it is
+    fail.Keyring (priority 0), the null keyring or an empty chainer (-1).
+    keyring.core.recommended() is keyring's own test for a real one
+    (priority >= 1); it also rules out keyrings.alt's plaintext files, which
+    are no better than the owner-only file. Detection only inspects the
+    chosen backend -- no probe write -- so it costs little per invocation.
+    """
+    file = _FileTokenSecret(path)
+    keyring = _import_keyring()
+    if keyring is None:
+        _warn_tokens_in_file(
+            "the keyring package is not installed; install mcp2cli[keyring] "
+            "(e.g. uv tool install 'mcp2cli[keyring]') to use the OS keyring"
+        )
+        return file
+    try:
+        backend = keyring.get_keyring()
+    except Exception as exc:  # a broken keyringrc.cfg or PYTHON_KEYRING_BACKEND
+        _warn_tokens_in_file(f"the keyring backend failed to load ({exc})")
+        return file
+    if not keyring.core.recommended(backend):
+        _warn_tokens_in_file(
+            f"no OS keyring is available ({backend}); on Linux this needs a "
+            "running Secret Service such as GNOME Keyring or KWallet"
+        )
+        return file
+    return _KeyringTokenSecret(backend, server_url, file)
 
 
 class FileTokenStorage:
-    """File-based token storage for OAuth tokens and client info.
+    """Storage for OAuth tokens and client info, one directory per server.
 
-    Persists an absolute ``expires_at`` timestamp alongside ``tokens.json``
-    (in ``tokens_meta.json``) so that on a fresh process the SDK can tell an
-    access token has expired and trigger a refresh, rather than blindly
-    re-sending the stale Bearer and falling through to a full re-auth that
-    reuses a possibly-forgotten DCR client_id (issue #50).
+    The tokens live in the OS keyring when one is usable, otherwise in
+    ``tokens.json`` (see _token_secret_store). Everything else is a file.
+
+    Persists an absolute ``expires_at`` timestamp alongside the tokens (in
+    ``tokens_meta.json``, not a secret) so that on a fresh process the SDK
+    can tell an access token has expired and trigger a refresh, rather than
+    blindly re-sending the stale Bearer and falling through to a full
+    re-auth that reuses a possibly-forgotten DCR client_id (issue #50).
 
     Everything here is a credential -- refresh tokens may be offline tokens
     with no expiry, and client.json may hold a client_secret -- so the
@@ -1053,6 +1203,7 @@ class FileTokenStorage:
     """
 
     def __init__(self, server_url: str):
+        self._server_url = server_url
         key = hashlib.sha256(server_url.encode()).hexdigest()[:16]
         self._dir = OAUTH_DIR / key
         _make_private_dir(OAUTH_DIR)
@@ -1066,19 +1217,23 @@ class FileTokenStorage:
         self._tokens_meta_path = self._dir / "tokens_meta.json"
         self._client_path = self._dir / "client.json"
 
+    @cached_property
+    def _tokens(self) -> _FileTokenSecret | _KeyringTokenSecret:
+        return _token_secret_store(self._server_url, self._tokens_path)
+
     async def get_tokens(self):
         from mcp.shared.auth import OAuthToken
 
-        if not self._tokens_path.exists():
+        text = self._tokens.read()
+        if text is None:
             return None
         try:
-            data = json.loads(self._tokens_path.read_text())
-            return OAuthToken(**data)
+            return OAuthToken(**json.loads(text))
         except Exception:
             return None
 
     async def set_tokens(self, tokens) -> None:
-        _write_private_file(self._tokens_path, tokens.model_dump_json())
+        self._tokens.write(tokens.model_dump_json())
         # Persist an absolute expiry timestamp so we can detect on a
         # later process start that the access token has expired.
         if tokens.expires_in is not None:
@@ -1110,12 +1265,9 @@ class FileTokenStorage:
             return None
 
     def clear_tokens(self) -> None:
-        """Remove persisted tokens and their expiry sidecar."""
-        for path in (self._tokens_path, self._tokens_meta_path):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+        """Remove persisted tokens (keyring entry and file) and their expiry."""
+        self._tokens.delete()
+        self._tokens_meta_path.unlink(missing_ok=True)
 
     def clear_client_info(self) -> None:
         """Remove persisted DCR client info so a fresh registration runs."""

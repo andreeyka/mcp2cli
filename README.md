@@ -80,8 +80,21 @@ mcp2cli --graphql https://api.example.com/graphql --oauth --oauth-scope "read wr
 mcp2cli --spec ./openapi.json --base-url https://api.example.com --oauth --list
 ```
 
-Tokens are persisted in `~/.cache/mcp2cli/oauth/` so subsequent calls reuse existing tokens
-and refresh automatically when they expire.
+Tokens are persisted so subsequent calls reuse existing tokens and refresh automatically
+when they expire. With the `keyring` extra installed they live in the OS secret store
+(macOS Keychain, Linux Secret Service, Windows Credential Manager) under the service
+`mcp2cli`, one entry per server URL:
+
+```bash
+uv tool install 'mcp2cli[keyring]'   # or: pip install 'mcp2cli[keyring]'
+```
+
+Without it — or when no keyring is reachable (e.g. a headless Linux box without a running
+Secret Service) or it refuses a write (Windows Credential Manager caps a secret at 2560
+bytes, which a token set usually exceeds) — tokens go to an owner-only (0600) file in
+`~/.cache/mcp2cli/oauth/`, and mcp2cli says so once per run on stderr. A token file left by
+an older version is moved into the keyring on first use. Client registrations and the token
+expiry timestamp stay in that directory either way.
 
 #### Headless hosts — no browser on the machine running mcp2cli
 

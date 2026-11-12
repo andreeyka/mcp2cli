@@ -6,7 +6,11 @@ import os
 import subprocess
 import sys
 
+import keyring
 import pytest
+from keyring.backend import KeyringBackend
+from keyring.backends import fail
+from keyring.errors import PasswordDeleteError, PasswordSetError
 
 import mcp2cli
 
@@ -14,6 +18,61 @@ import mcp2cli
 posix_only = pytest.mark.skipif(
     sys.platform == "win32", reason="POSIX permission bits"
 )
+
+
+class MemoryKeyring(KeyringBackend):
+    """An OS keyring stand-in that keeps entries in a dict."""
+
+    priority = 1
+
+    def __init__(self):
+        super().__init__()
+        self.entries: dict[tuple[str, str], str] = {}
+
+    def get_password(self, service, username):
+        return self.entries.get((service, username))
+
+    def set_password(self, service, username, password):
+        self.entries[(service, username)] = password
+
+    def delete_password(self, service, username):
+        if self.entries.pop((service, username), None) is None:
+            raise PasswordDeleteError(username)
+
+
+class RefusingKeyring(MemoryKeyring):
+    """A keyring that is present but refuses writes (a locked keychain)."""
+
+    def __init__(self, error: Exception):
+        super().__init__()
+        self.error = error
+
+    def set_password(self, service, username, password):
+        raise self.error
+
+
+class UnreadableKeyring(MemoryKeyring):
+    """A keyring whose reads fail (D-Bus gone mid-session, say)."""
+
+    def get_password(self, service, username):
+        raise RuntimeError("org.freedesktop.secrets is not reachable")
+
+
+@pytest.fixture(autouse=True)
+def memory_keyring():
+    """Tokens go to an in-memory keyring (conftest restores the backend)."""
+    backend = MemoryKeyring()
+    keyring.set_keyring(backend)
+    return backend
+
+
+@pytest.fixture
+def token_file():
+    """No usable keyring (keyring's fail backend): tokens go to the file."""
+    keyring.set_keyring(fail.Keyring())
+
+
+_TOKENS_IN_FILE = "Warning: OAuth tokens are stored in an owner-only file"
 
 
 @pytest.fixture
@@ -251,7 +310,7 @@ class TestFileTokenStorage:
 
     @posix_only
     def test_set_tokens_writes_owner_only_files(
-        self, tmp_path, monkeypatch, permissive_umask
+        self, tmp_path, monkeypatch, permissive_umask, token_file
     ):
         import anyio
         from mcp.shared.auth import OAuthToken
@@ -334,7 +393,9 @@ class TestFileTokenStorage:
         assert _mode(storage._dir) == 0o700
         assert [_mode(path) for path in files] == [0o600] * len(files)
 
-    def test_writes_leave_no_temp_files_behind(self, tmp_path, monkeypatch):
+    def test_writes_leave_no_temp_files_behind(
+        self, tmp_path, monkeypatch, token_file
+    ):
         import anyio
         from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
@@ -355,6 +416,196 @@ class TestFileTokenStorage:
         assert sorted(p.name for p in storage._dir.iterdir()) == [
             "client.json", "tokens.json", "tokens_meta.json",
         ]
+
+
+class TestKeyringTokenStorage:
+    """OAuth tokens live in the OS keyring when one is usable (else a file)."""
+
+    URL = "https://example.com/mcp"
+
+    @staticmethod
+    def _token(access="a", refresh="r"):
+        from mcp.shared.auth import OAuthToken
+
+        return OAuthToken(
+            access_token=access, token_type="Bearer",
+            refresh_token=refresh, expires_in=3600,
+        )
+
+    def _storage(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        return mcp2cli.FileTokenStorage(self.URL)
+
+    def _entry(self, backend):
+        return backend.entries.get((mcp2cli.OAUTH_KEYRING_SERVICE, self.URL))
+
+    def test_tokens_go_to_keyring_not_disk(
+        self, tmp_path, monkeypatch, capsys, memory_keyring
+    ):
+        import anyio
+
+        storage = self._storage(tmp_path, monkeypatch)
+        anyio.run(storage.set_tokens, self._token())
+
+        assert json.loads(self._entry(memory_keyring))["refresh_token"] == "r"
+        assert not storage._tokens_path.exists()
+        loaded = anyio.run(storage.get_tokens)
+        assert (loaded.access_token, loaded.refresh_token) == ("a", "r")
+        # The expiry sidecar is not a secret and stays a file.
+        assert storage.get_expires_at() is not None
+        assert capsys.readouterr().err == ""
+
+    def test_token_file_is_moved_into_keyring(
+        self, tmp_path, monkeypatch, capsys, memory_keyring
+    ):
+        """A tokens.json left by an older version ends up in the keyring."""
+        import anyio
+
+        storage = self._storage(tmp_path, monkeypatch)
+        storage._tokens_path.write_text(self._token().model_dump_json())
+
+        loaded = anyio.run(storage.get_tokens)
+
+        assert loaded.refresh_token == "r"
+        assert json.loads(self._entry(memory_keyring))["refresh_token"] == "r"
+        assert not storage._tokens_path.exists()
+        assert anyio.run(storage.get_tokens).refresh_token == "r"
+        assert capsys.readouterr().err == ""
+
+    def test_token_file_wins_over_older_keyring_entry(
+        self, tmp_path, monkeypatch, memory_keyring
+    ):
+        """A file only outlives a keyring write when it is newer (a fallback
+        write, or a run without the keyring), so it replaces the entry."""
+        import anyio
+
+        storage = self._storage(tmp_path, monkeypatch)
+        anyio.run(storage.set_tokens, self._token(refresh="old"))
+        storage._tokens_path.write_text(self._token(refresh="new").model_dump_json())
+
+        assert anyio.run(storage.get_tokens).refresh_token == "new"
+        assert json.loads(self._entry(memory_keyring))["refresh_token"] == "new"
+        assert not storage._tokens_path.exists()
+
+    @posix_only
+    def test_no_keyring_backend_uses_private_file_and_warns_once(
+        self, tmp_path, monkeypatch, capsys, permissive_umask, token_file
+    ):
+        import anyio
+
+        storage = self._storage(tmp_path, monkeypatch)
+        anyio.run(storage.set_tokens, self._token())
+        other = mcp2cli.FileTokenStorage("https://other.example.com/mcp")
+        anyio.run(other.set_tokens, self._token())
+
+        assert _mode(storage._tokens_path) == 0o600
+        assert anyio.run(storage.get_tokens).refresh_token == "r"
+        err = capsys.readouterr().err
+        assert err.count(_TOKENS_IN_FILE) == 1
+        assert "Secret Service" in err
+
+    def test_keyring_not_installed_uses_file_and_warns_once(
+        self, tmp_path, monkeypatch, capsys, memory_keyring
+    ):
+        import anyio
+
+        monkeypatch.setattr(mcp2cli, "_import_keyring", lambda: None)
+        storage = self._storage(tmp_path, monkeypatch)
+        anyio.run(storage.set_tokens, self._token())
+        assert anyio.run(storage.get_tokens).refresh_token == "r"
+        anyio.run(storage.set_tokens, self._token(refresh="r2"))
+
+        assert json.loads(storage._tokens_path.read_text())["refresh_token"] == "r2"
+        assert memory_keyring.entries == {}
+        err = capsys.readouterr().err
+        assert err.count(_TOKENS_IN_FILE) == 1
+        assert "mcp2cli[keyring]" in err
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            PasswordSetError("Can't store password on keychain"),
+            # Windows Credential Manager rejects a blob over 2560 bytes with
+            # pywintypes.error, which is not a KeyringError.
+            RuntimeError("(1783, 'CredWrite', 'The stub received bad data.')"),
+        ],
+    )
+    def test_refused_write_falls_back_to_file(
+        self, tmp_path, monkeypatch, capsys, error
+    ):
+        """The freshly issued tokens must survive the keyring refusing them,
+        and win over whatever older entry the keyring still holds."""
+        import anyio
+
+        backend = RefusingKeyring(error)
+        backend.entries[(mcp2cli.OAUTH_KEYRING_SERVICE, self.URL)] = (
+            self._token(refresh="stale").model_dump_json()
+        )
+        keyring.set_keyring(backend)
+        storage = self._storage(tmp_path, monkeypatch)
+
+        anyio.run(storage.set_tokens, self._token(refresh="fresh"))
+        anyio.run(storage.set_tokens, self._token(refresh="fresher"))
+
+        assert anyio.run(storage.get_tokens).refresh_token == "fresher"
+        assert storage._tokens_path.exists()
+        err = capsys.readouterr().err
+        assert err.count(_TOKENS_IN_FILE) == 1
+        assert str(error) in err
+
+    def test_refused_migration_keeps_token_file(self, tmp_path, monkeypatch, capsys):
+        import anyio
+
+        keyring.set_keyring(RefusingKeyring(PasswordSetError("locked")))
+        storage = self._storage(tmp_path, monkeypatch)
+        storage._tokens_path.write_text(self._token().model_dump_json())
+
+        assert anyio.run(storage.get_tokens).refresh_token == "r"
+        assert storage._tokens_path.exists()
+        assert capsys.readouterr().err.count(_TOKENS_IN_FILE) == 1
+
+    def test_unreadable_keyring_returns_none(self, tmp_path, monkeypatch):
+        import anyio
+
+        keyring.set_keyring(UnreadableKeyring())
+        storage = self._storage(tmp_path, monkeypatch)
+        assert anyio.run(storage.get_tokens) is None
+
+    def test_corrupt_keyring_value_returns_none(
+        self, tmp_path, monkeypatch, memory_keyring
+    ):
+        import anyio
+
+        memory_keyring.entries[(mcp2cli.OAUTH_KEYRING_SERVICE, self.URL)] = "{{{"
+        storage = self._storage(tmp_path, monkeypatch)
+        assert anyio.run(storage.get_tokens) is None
+
+    def test_clear_tokens_clears_keyring_and_files(
+        self, tmp_path, monkeypatch, memory_keyring
+    ):
+        import anyio
+
+        storage = self._storage(tmp_path, monkeypatch)
+        anyio.run(storage.set_tokens, self._token())
+        storage._tokens_path.write_text(self._token().model_dump_json())
+
+        storage.clear_tokens()
+
+        assert self._entry(memory_keyring) is None
+        assert not storage._tokens_path.exists()
+        assert not storage._tokens_meta_path.exists()
+        assert anyio.run(storage.get_tokens) is None
+        # Nothing left to delete: the keyring's "not found" is not an error.
+        storage.clear_tokens()
+
+    def test_keyring_is_only_imported_for_token_access(self, tmp_path, monkeypatch):
+        def _no_import():
+            raise AssertionError("keyring imported without token access")
+
+        monkeypatch.setattr(mcp2cli, "_import_keyring", _no_import)
+        storage = self._storage(tmp_path, monkeypatch)
+        assert mcp2cli._get_cached_redirect_uri(storage) is None
+        assert storage.get_expires_at() is None
 
 
 class TestRobustOAuthClientProvider:
@@ -487,7 +738,9 @@ class TestRobustOAuthClientProvider:
 
         anyio.run(_drive)
 
-    def test_transient_refresh_failure_preserves_cache(self, tmp_path, monkeypatch):
+    def test_transient_refresh_failure_preserves_cache(
+        self, tmp_path, monkeypatch, token_file
+    ):
         """Issue #59: a transient refresh failure (5xx, network blip) must
         NOT erase client.json/tokens.json, otherwise the next headless run
         is forced into an interactive consent it can never complete."""
